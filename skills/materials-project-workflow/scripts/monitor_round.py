@@ -44,22 +44,33 @@ monitor.json (paths relative to its folder, the project root; state and log go t
        "local": "calculations/dft", "program": "vasp",
        "records": {"file": "calculations/dft/JOBS.csv", "id_column": "job_id",
                    "outcome_column": "outcome", "state_column": ""},
-       "copy": [], "require": [], "forbid": [], "check_every_end": false}]}
+       "copy": [], "compress": [], "compress_mb": 5, "max_copy_mb": 20, "copy_any_size": [],
+       "require": [], "forbid": [], "check_every_end": false}]}
 
 `scheduler` is slurm or pbs; `program` is vasp, orca or cp2k; an empty `copy` uses the
-program's default list; a job's remote folder below `prefix` maps to the same folder
-below `local`.
+program's default list (VASP's leaves out WAVECAR and CHGCAR); a job's remote folder below
+`prefix` maps to the same folder below `local`. A listed file above `compress_mb` (default
+5; 0 never compresses) that matches `compress` (default: the program's large text outputs,
+VASP OUTCAR, vasprun.xml, XDATCAR, PROCAR, DOSCAR and EIGENVAL) arrives as <name>.gz,
+compressed while it is copied, so nothing is written on the cluster; the checks read it.
+Any other listed file above `max_copy_mb` (default 20; 0 means no limit) stays on the
+cluster and is named in MONITOR_CHECK.json, unless it matches `copy_any_size`, which
+defaults to the files the checks read (VASP OUTCAR and OSZICAR, ORCA *.out, CP2K *.out
+and *.log).
 """
 import argparse
 import base64
 import csv
 import datetime
 import fcntl
+import fnmatch
 import glob
+import gzip
 import hashlib
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -76,6 +87,10 @@ DEFAULT_COPY = {
     "orca": ["*.inp", "*.out", "*.xyz", "*.hess", "*.o[0-9]*", "*.e[0-9]*", "slurm-*"],
     "cp2k": ["*.inp", "*.out", "*.log", "*-pos-*.xyz", "*.o[0-9]*", "*.e[0-9]*", "slurm-*"],
 }
+CHECK_FILES = {"vasp": ["OUTCAR", "OSZICAR"], "orca": ["*.out"], "cp2k": ["*.out", "*.log"]}
+COMPRESS = {"vasp": ["OUTCAR", "vasprun.xml", "XDATCAR", "PROCAR", "DOSCAR", "EIGENVAL"],
+            "orca": ["*.out", "*.xyz", "*.hess"], "cp2k": ["*.out", "*.log", "*.xyz"]}
+MAX_COPY_MB, COMPRESS_MB = 20, 5
 VASP_END = "General timing and accounting informations for this job"
 VASP_RELAXED = "reached required accuracy"
 ORCA_END = "****ORCA TERMINATED NORMALLY****"
@@ -105,13 +120,21 @@ def save_json(path, data):
 
 
 def read(path):
+    """Text of a file, a .gz one decompressed; empty for an unreadable or oversized file."""
     try:
+        if path.endswith(".gz"):
+            with gzip.open(path, "rt", errors="replace") as handle:
+                return handle.read(MAX_TEXT)
         if os.path.getsize(path) > MAX_TEXT:
             return ""
         with open(path, errors="replace") as handle:
             return handle.read()
-    except OSError:
+    except (OSError, EOFError):
         return ""
+
+
+def matches(name, patterns):
+    return any(fnmatch.fnmatchcase(name, p) for p in patterns)
 
 
 def stamp():
@@ -190,15 +213,68 @@ class Round:
             raise ValueError("%s is outside %s" % (remote_dir, group["prefix"]))
         return os.path.normpath(os.path.join(self.path(group["local"]), rel))
 
+    def shell(self, group, command, **kw):
+        cmd = ["sh", "-c", command] if group["host"] == "local" else SSH + [group["host"], command]
+        return subprocess.run(cmd, timeout=1800, **kw)
+
+    def remote_files(self, group, remote_dir):
+        """(relative path, bytes, mtime) of every file below the job folder."""
+        if group["host"] == "local":
+            return [(os.path.relpath(os.path.join(d, n), remote_dir), st.st_size, st.st_mtime)
+                    for d, _, names in os.walk(remote_dir) for n in names
+                    for st in [os.stat(os.path.join(d, n))]]
+        done = self.shell(group, "find %s -type f -printf '%%s\\t%%T@\\t%%P\\n'" % shlex.quote(remote_dir),
+                          capture_output=True, text=True)
+        if done.returncode != 0:
+            raise RuntimeError("listing failed (exit %d): %s" % (done.returncode, done.stderr.strip()[-300:]))
+        rows = [line.split("\t", 2) for line in done.stdout.splitlines() if line.count("\t") >= 2]
+        return [(rel, int(size), float(mtime)) for size, mtime, rel in rows]
+
     def copy_back(self, group, remote_dir, local_dir):
-        patterns = group.get("copy") or DEFAULT_COPY.get(group.get("program"), ["*"])
+        """Copy an ended job's listed files; large text files arrive gzipped. Return the files left behind."""
+        program = group.get("program")
+        patterns = group.get("copy") or DEFAULT_COPY.get(program, ["*"])
+        any_size = group.get("copy_any_size") or CHECK_FILES.get(program, [])
+        squeeze = group.get("compress") or COMPRESS.get(program, [])
+        limit, small = group.get("max_copy_mb", MAX_COPY_MB), group.get("compress_mb", COMPRESS_MB)
+        packed, left = [], []
+        for rel, size, mtime in self.remote_files(group, remote_dir):
+            name, mb = os.path.basename(rel), size / 1048576.0
+            if not (matches(name, patterns) or matches(name, any_size)):
+                continue
+            if small and mb > small and matches(name, squeeze):
+                packed.append((rel, mtime))
+            elif limit and mb > limit and not matches(name, any_size):
+                left.append("%s (%.0f MB)" % (rel, mb))
         os.makedirs(local_dir, exist_ok=True)
         source = remote_dir + "/" if group["host"] == "local" else "%s:%s/" % (group["host"], remote_dir)
-        cmd = (["rsync", "-a", "--prune-empty-dirs", "--backup", "--suffix=.before_copy", "-e", " ".join(SSH),
-                "--include=*/"] + ["--include=%s" % p for p in patterns] + ["--exclude=*", source, local_dir + "/"])
+        skip = [rel for rel, _ in packed] + [item.rsplit(" (", 1)[0] for item in left]
+        cmd = (["rsync", "-a", "--prune-empty-dirs", "--backup", "--suffix=.before_copy", "-e", " ".join(SSH)]
+               + ["--exclude=/%s" % rel for rel in skip] + ["--include=*/"]
+               + ["--include=%s" % p for p in patterns + any_size] + ["--exclude=*", source, local_dir + "/"])
         done = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
         if done.returncode != 0:
             raise RuntimeError("rsync exit %d: %s" % (done.returncode, done.stderr.strip()[-300:]))
+        for rel, mtime in packed:  # compressed on the fly; nothing is written on the cluster
+            target = os.path.join(local_dir, rel + ".gz")
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target + ".part", "wb") as out:
+                done = self.shell(group, "gzip -c -- %s" % shlex.quote(os.path.join(remote_dir, rel)),
+                                  stdout=out, stderr=subprocess.PIPE)
+            try:
+                if done.returncode != 0:
+                    raise RuntimeError("gzip of %s failed: %s" % (rel, done.stderr.decode(errors="replace")[-300:]))
+                with gzip.open(target + ".part") as check:  # reading to the end verifies the CRC
+                    while check.read(1 << 22):
+                        pass
+            except Exception:
+                os.remove(target + ".part")
+                raise
+            if os.path.exists(target):
+                os.replace(target, target + ".before_copy")
+            os.replace(target + ".part", target)
+            os.utime(target, (mtime, mtime))
+        return left
 
     def check_outputs(self, group, local_dir, start):
         """Return (problems, facts, files) for one ended job's copied outputs."""
@@ -210,12 +286,17 @@ class Round:
         if checker is None:
             return ["unknown program %r" % group.get("program")], {}, []
         problems, facts, files = checker(local_dir, set(fresh))
-        texts = {f: read(f) for f in fresh}
-        for pattern in group.get("require", []):
-            if not any(re.search(pattern, t) for t in texts.values()):
-                problems.append("required pattern not found: %s" % pattern)
-        for pattern in group.get("forbid", []):
-            hits = sorted(os.path.basename(f) for f, t in texts.items() if re.search(pattern, t))
+        require, forbid = group.get("require", []), group.get("forbid", [])
+        found, hits_by = set(), {pattern: [] for pattern in forbid}
+        for f in fresh if require or forbid else []:  # one file in memory at a time
+            text = read(f)
+            found.update(pattern for pattern in require if re.search(pattern, text))
+            for pattern in forbid:
+                if re.search(pattern, text):
+                    hits_by[pattern].append(os.path.basename(f))
+        problems += ["required pattern not found: %s" % pattern for pattern in require if pattern not in found]
+        for pattern in forbid:
+            hits = sorted(hits_by[pattern])
             if hits:
                 problems.append("forbidden pattern %s in %s" % (pattern, ", ".join(hits)))
                 files += [f for f in fresh if os.path.basename(f) in hits and f not in files]
@@ -299,8 +380,10 @@ class Round:
         files, problems, facts, local = [], [], {}, None
         try:
             local = self.local_dir(group, job["dir"])
-            self.copy_back(group, job["dir"], local)
+            left = self.copy_back(group, job["dir"], local)
             problems, facts, files = self.check_outputs(group, local, job.get("start_epoch"))
+            if left:
+                facts["left_on_cluster"] = left
         except Exception as exc:
             problems = ["copy or check failed: %s" % exc]
         sched = job["state"].split()[0]
@@ -473,13 +556,16 @@ class Round:
 
 def main_outputs(local_dir, fresh, pattern):
     """Top-level files of the job folder matching pattern, split into (fresh, stale)."""
-    found = sorted(f for f in glob.glob(os.path.join(local_dir, pattern)) if os.path.isfile(f))
+    found = sorted(f for p in (pattern, pattern + ".gz") for f in glob.glob(os.path.join(local_dir, p))
+                   if os.path.isfile(f))
     return [f for f in found if f in fresh], [f for f in found if f not in fresh]
 
 
 def check_vasp(local_dir, fresh):
     problems, facts = [], {}
     outcar, oszicar = os.path.join(local_dir, "OUTCAR"), os.path.join(local_dir, "OSZICAR")
+    if outcar + ".gz" in fresh:
+        outcar += ".gz"
     files = [f for f in (outcar, oszicar) if os.path.isfile(f)]
     if outcar not in fresh:
         return ["no OUTCAR written during this job" + (" (an older one is there)" if os.path.isfile(outcar) else "")], facts, files

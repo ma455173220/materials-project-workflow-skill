@@ -3,6 +3,7 @@
     python3 -m unittest -v test_monitor_round.py      (from this folder)
 """
 import csv
+import gzip
 import io
 import json
 import os
@@ -243,6 +244,50 @@ class Vasp(Project):
         self.finish("1", path, VASP_RELAX_OK)
         self.assertEqual(open(os.path.join(local, "INCAR.before_copy")).read(), "my next-stage INCAR\n")
 
+    def test_large_files_stay_on_cluster_except_checked_ones(self):
+        path = self.start(max_copy_mb=0.01)  # about 10 KB
+        files = dict(VASP_RELAX_OK, **{"vasprun.xml": "x" * 20000, "slurm-1.out": "y" * 20000, "vasp.err": "small\n"})
+        files["OUTCAR"] = "z" * 20000 + "\n" + files["OUTCAR"]
+        self.finish("1", path, files)
+        self.assertEqual(self.record("1")["outcome"], "completed")
+        local = os.path.join(self.root, "calc/G/run1")
+        self.assertEqual(sorted(os.listdir(local)), ["INCAR", "MONITOR_CHECK.json", "OSZICAR", "OUTCAR", "vasp.err"])
+
+    def test_size_limit_and_exemptions_set_by_project(self):
+        path = self.start(max_copy_mb=0.01, copy_any_size=["OUTCAR", "OSZICAR", "slurm-*"])
+        self.finish("1", path, dict(VASP_RELAX_OK, **{"slurm-1.out": "y" * 20000}))
+        self.assertTrue(os.path.exists(os.path.join(self.root, "calc/G/run1/slurm-1.out")))
+        path = self.job_dir("H", "run2")
+        self.group(name="H", max_copy_mb=0, copy=["*"])
+        self.write_records(["1", "2"], outcome="")
+        self.queued("2", path)
+        self.run_round()
+        self.finish("2", path, dict(VASP_RELAX_OK, **{"slurm-2.out": "y" * 20000}))
+        self.assertTrue(os.path.exists(os.path.join(self.root, "calc/H/run2/WAVECAR")))
+
+    def test_large_text_outputs_arrive_compressed_and_are_checked(self):
+        path = self.start(max_copy_mb=0.01, compress_mb=0.01)  # about 10 KB
+        files = dict(VASP_RELAX_OK, **{"vasprun.xml": "<v>" * 7000, "slurm-1.out": "y" * 20000})
+        files["OUTCAR"] = "z" * 20000 + "\n" + files["OUTCAR"]
+        self.finish("1", path, files)
+        self.assertEqual(self.record("1")["outcome"], "completed")
+        local = os.path.join(self.root, "calc/G/run1")
+        self.assertEqual(sorted(os.listdir(local)),
+                         ["INCAR", "MONITOR_CHECK.json", "OSZICAR", "OUTCAR.gz", "vasprun.xml.gz"])
+        with gzip.open(os.path.join(local, "vasprun.xml.gz"), "rt") as handle:
+            self.assertEqual(handle.read(), files["vasprun.xml"])
+        self.assertAlmostEqual(os.path.getmtime(os.path.join(local, "OUTCAR.gz")),
+                               os.path.getmtime(os.path.join(path, "OUTCAR")), delta=1)
+        check = json.load(open(os.path.join(local, "MONITOR_CHECK.json")))
+        self.assertEqual(check["facts"]["left_on_cluster"], ["slurm-1.out (0 MB)"])
+        self.assertFalse(os.path.exists(os.path.join(path, "OUTCAR.gz")))  # nothing written on the cluster
+
+    def test_compressed_outcar_without_normal_end_is_attention(self):
+        path = self.start(compress_mb=0.01)
+        files = dict(VASP_RELAX_OK, OUTCAR="z" * 20000 + "\nreached required accuracy\n")
+        text = self.finish("1", path, files)[1]
+        self.assertIn("no normal-end timing section", text)
+
     def test_record_row_with_extra_column_refused(self):
         path = self.start()
         with open(self.records, "a") as handle:
@@ -292,6 +337,13 @@ class OrcaCp2k(Project):
                                 "FINAL SINGLE POINT ENERGY     -100.123\n****ORCA TERMINATED NORMALLY****\n")
         self.finish("1", path, {"opt.out": out})
         self.assertEqual(self.record("1")["outcome"], "completed")
+
+    def test_orca_large_output_compressed(self):
+        path = self.start(program="orca", compress_mb=0.01)
+        out = self.ORCA_HEAD + "x" * 20000 + ("\nFINAL SINGLE POINT ENERGY     -100.123\n****ORCA TERMINATED NORMALLY****\n")
+        self.finish("1", path, {"sp.out": out})
+        self.assertEqual(self.record("1")["outcome"], "completed")
+        self.assertTrue(os.path.exists(os.path.join(self.root, "calc/G/run1/sp.out.gz")))
 
     def test_orca_scf_not_converged_but_terminated_normally(self):  # review item 7
         path = self.start(program="orca")
@@ -427,6 +479,16 @@ class Lifecycle(Project):
                 redirect_stdout(buf):
             self.assertEqual(M.main(), 2)
         self.assertIn("FAILED", buf.getvalue())
+
+
+class RemoteListing(unittest.TestCase):
+    def test_find_output_parsed(self):
+        rnd = M.Round.__new__(M.Round)
+        out = "1234\t1700000000.5\tOUTCAR\n99\t1700000001.0\tsub dir/vasprun.xml\n"
+        with mock.patch.object(M.Round, "shell", return_value=mock.Mock(returncode=0, stdout=out, stderr="")) as sh:
+            rows = rnd.remote_files({"host": "u@h"}, "/scratch/a b")
+        self.assertEqual(rows, [("OUTCAR", 1234, 1700000000.5), ("sub dir/vasprun.xml", 99, 1700000001.0)])
+        self.assertIn("find '/scratch/a b' -type f -printf '%s\\t%T@\\t%P\\n'", sh.call_args[0][1])
 
 
 class PbsProbe(unittest.TestCase):
